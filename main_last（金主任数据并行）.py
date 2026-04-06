@@ -6,6 +6,9 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from ollama import Client  # 导入 Client 用于指定特定端口的多卡分发
 import queue
+# 🌟 新增 import（移植自王主任代码）
+import re
+from json_repair import repair_json
 
 # ==========================================
 # 工具函数区域 (修改为支持 client 指定端口，并隔离GPU)
@@ -21,6 +24,31 @@ PORT_TO_GPU = {
 gpu_port_queue = queue.Queue()
 for p in PORT_TO_GPU.keys():
     gpu_port_queue.put(p)
+
+# 🌟 新增：normalize_nulls 清洗假 null（移植自王主任代码）
+def normalize_nulls(data_dict):
+    """将字符串形式的假 null 统一清洗为真实的 None"""
+    for key, value in data_dict.items():
+        if isinstance(value, str) and value.strip().lower() in ["null", "none", ""]:
+            data_dict[key] = None
+    return data_dict
+
+# 🌟 新增：患者信息缓存目录和 PROMPT_HEADER（移植自王主任二单）
+PATIENT_CACHE_DIR = "patient_base_info"
+os.makedirs(PATIENT_CACHE_DIR, exist_ok=True)
+
+PROMPT_HEADER = """
+你是一个专业的医疗数据提取员。图片是一张重症护理记录单的最顶部区域。
+请提取病人的基础信息，按以下JSON格式输出单个对象：
+{
+    "姓名": "字符串，若为空则填 null",
+    "床号": "字符串，若为空则填 null",
+    "住院号": "字符串，若为空则填 null"
+}
+严格规则：
+1. 必须一律使用双引号包裹作为字符串输出。
+2. 仅输出纯JSON对象（花括号包裹），不要包含 ```json 等解释文字。
+"""
 
 # ==========================================
 PROMPT_L = """
@@ -60,9 +88,11 @@ PROMPT_L = """
 }
 
 **严格规则：**
-1. 空白单元格必须填 null，严禁编造数据
-2. 数值保持原始格式（血压用斜杠，不要拆分）
-3. 仅输出纯JSON对象（花括号包裹），不要输出数组（方括号），不要包含 ```json 或任何解释文字
+1. **强制字符串法则**：无论你提取到的是纯数字（如 14）、带有符号的数字（如 14→12）、还是纯文字，**必须一律使用双引号包裹，作为字符串输出**！
+2. **空白处理**：如果红线围成的格子内是空白或无数据，必须直接输出小写的 null（**注意：null 本身不要加双引号**），严禁编造数据。
+3. 图片中已经为你绘制了红色的垂直辅助线。红线是严格的列边界，请绝对不要跨越红线读取数据！
+4. 数值保持原始格式（血压用斜杠，不要拆分）
+5. 仅输出纯JSON对象（花括号包裹），不要输出数组（方括号），不要包含 ```json 或任何解释文字
 """
 
 PROMPT_M = """
@@ -99,9 +129,11 @@ PROMPT_M = """
 }
 
 **严格规则：**
-1. 空白单元格必须填 null，严禁编造数据
-2. 数值仅保留数字，不要添加单位（单位已在字段说明中）
-3. 仅输出纯JSON对象（花括号包裹），不要输出数组，不要包含 ```json 或任何解释文字
+1. **强制字符串法则**：无论你提取到的是纯数字（如 14）、带有符号的数字（如 14→12）、还是纯文字，**必须一律使用双引号包裹，作为字符串输出**！
+2. **空白处理**：如果红线围成的格子内是空白或无数据，必须直接输出小写的 null（**注意：null 本身不要加双引号**），严禁编造数据。
+3. 图片中已经为你绘制了红色的垂直辅助线。红线是严格的列边界，请绝对不要跨越红线读取数据！
+4. 数值仅保留数字，不要添加单位（单位已在字段说明中）
+5. 仅输出纯JSON对象（花括号包裹），不要输出数组，不要包含 ```json 或任何解释文字
 """
     
 
@@ -133,10 +165,11 @@ PROMPT_R = """
 }
 
 **严格规则：**
-1. 空白单元格必须填 null，严禁编造数据
-2. "病情观察及处理"字段可能包含长文本，需完整提取，不要截断
-3. 数值字段仅保留数字，不要添加单位
-4. 仅输出纯JSON对象（花括号包裹），不要输出数组，不要包含 ```json 或任何解释文字
+1. **强制字符串法则**：无论你提取到的是纯数字（如 14）、带有符号的数字（如 14→12）、还是纯文字，**必须一律使用双引号包裹，作为字符串输出**！如果内容为空，必须直接输出小写的 null（null 本身不要加双引号）。
+2. 图片中已经为你绘制了红色的垂直辅助线。红线是严格的列边界，请绝对不要跨越红线读取数据！
+3. "病情观察及处理"字段可能包含长文本，需完整提取，不要截断
+4. 数值字段仅保留数字，不要添加单位
+5. 仅输出纯JSON对象（花括号包裹），不要输出数组，不要包含 ```json 或任何解释文字
 """
 
 # ==========================================
@@ -169,47 +202,111 @@ def call_paddle_env_to_cut(img_path, output_dir, port):
         raise RuntimeError(f"未生成图片！可能未识别到表格。\nstderr:\n{result.stderr}")
 
 def extract_single_part(client, img_path, prompt_text, retries=3):
-    """单个切片识别，通过传递进来的 client 使用特定显卡端口"""
+    """单个切片识别，通过传递进来的 client 使用特定显卡端口
+    🌟 移植自王主任代码：JSON修复 + OCR辅助Prompt + 正则拦截"""
     if not img_path.exists():
         return {"_error": "文件不存在"}
 
+    # 🌟 步骤 1：寻找并读取底层切割器留下的同名 OCR 字典（移植自王主任二单）
+    txt_path = img_path.with_suffix('.txt')
+    ocr_text = ""
+    if txt_path.exists():
+        with open(txt_path, 'r', encoding='utf-8') as f:
+            ocr_text = f.read().strip()
+
+    # 🌟 步骤 2：动态拼装 Prompt（只有在 OCR 扫到字时才注入，避免空白切片的干扰）
+    dynamic_prompt = prompt_text
+    if ocr_text:
+        dynamic_prompt += f"""\n
+=========================================
+【OCR 辅助防漏字典】
+底层扫描器在当前切片中识别到了以下零散的文本碎片：
+[{ocr_text}]
+
+【使用规则】
+1. 你依然需要亲自"看图识字"，严格依据图片中表头的垂直对齐关系来提取数据。
+2. 上述字典仅为无序的文本碎片，请作为参考，用来核对你是否有漏字、错字（例如极易漏掉的短小字符或标点）。
+3. 如果图片中看到的与字典一致，请务必完整提取，绝不遗漏！
+=========================================
+"""
+
     for attempt in range(retries):
         try:
-            # ✅ 关键修改：使用 client 代替全局 ollama
+            # 🌟 步骤 3：发送动态拼装好的 dynamic_prompt
             response = client.chat(
                 model='qwen2.5vl:72b',
-                messages=[{'role': 'user', 'content': prompt_text, 'images': [str(img_path)]}],
+                messages=[{'role': 'user', 'content': dynamic_prompt, 'images': [str(img_path)]}],
                 options={"temperature": 0.0, "num_predict": 4096}
             )
-            raw = response['message']['content'].strip()
+            raw = response['message']['content']
             
-            # 清理 Markdown
-            if raw.startswith("```json"): raw = raw[7:]
-            if raw.startswith("```"): raw = raw[3:]
-            if raw.endswith("```"): raw = raw[:-3]
-            raw = raw.strip()
-            
+            # 【防御第一关】：用正则强行提取最外层的 {}，砍掉大模型可能附带的废话
+            match = re.search(r'\{.*\}', raw, re.DOTALL)
+            if match:
+                raw_json_str = match.group(0)
+            else:
+                raw_json_str = raw
+
+            # 🌟🌟🌟【re.sub 正则拦截】🌟🌟🌟
+            # 强制给大模型裸奔的"带符号数值"（如 14→12, 10-20）穿上双引号
+            raw_json_str = re.sub(r'(:\s*)([0-9]+(?:→|->|~|-)[0-9]+)(\s*[,}])', r'\1"\2"\3', raw_json_str)
+
             try:
-                data = json.loads(raw)
-                if isinstance(data, list):
-                    return data[0] if len(data) > 0 else {}
-                elif isinstance(data, dict):
-                    return data
-                else:
-                    raise ValueError(f"返回了未知的数据类型: {type(data)}")
+                # 尝试用标准库解析
+                data = json.loads(raw_json_str)
             except json.JSONDecodeError:
-                if attempt == retries - 1:
-                    return {"_error": "JSON解析失败", "_raw": raw[:200]}
-                continue
+                # 🌟🌟🌟【json_repair 修复兜底】🌟🌟🌟
+                # 如果标准解析依然失败（比如末尾多了个逗号），让神器自动修补
+                data = repair_json(raw_json_str, return_objects=True)
+                if not data:
+                    raise ValueError("json_repair 也无法修复该字符串")
+
+            # 统一格式化返回
+            if isinstance(data, list):
+                return data[0] if len(data) > 0 else {}
+            elif isinstance(data, dict):
+                return data
+            else:
+                raise ValueError(f"返回了未知的数据类型: {type(data)}")
 
         except Exception as e:
             if attempt == retries - 1:
-                return {"_error": str(e)}
-    
-    return {"_error": "重试多次失败"}
+                # 彻底失败时，保留原始文本供错题本记录
+                return {"_error": f"解析彻底失败", "_raw": raw}
+            # 失败则静默重试
+            continue
 
-def process_three_columns_batch(client, slice_dir, output_json, port):
-    """处理该图片切出来的所有块并合并保存"""
+    return {"_error": "重试多次均失败"}
+
+# 🌟 新增：患者信息缓存提取（移植自王主任二单）
+def extract_patient_info_once(client, slice_dir, img_name):
+    """提取病人基础信息并缓存到本地，已有档案则跳过"""
+    # 根据文件命名规范提取姓名，例如 "林昌海_23_7_..." -> "林昌海"
+    patient_name = img_name.split('_')[0]
+    cache_file = os.path.join(PATIENT_CACHE_DIR, f"{patient_name}.json")
+    
+    # 如果本地已经有这个人的档案了，直接 return，省下大模型算力！
+    if os.path.exists(cache_file):
+        return
+        
+    header_img_path = Path(slice_dir) / "_header_info.png"
+    if not header_img_path.exists():
+        return
+        
+    print(f"  💡 [初次建档] 正在为患者【{patient_name}】提取并建立基础信息档案...")
+    patient_data = extract_single_part(client, header_img_path, PROMPT_HEADER)
+    
+    # 写入独立的病人档案 JSON
+    if "_error" not in patient_data:
+        try:
+            with open(cache_file, 'w', encoding='utf-8') as f:
+                json.dump(patient_data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+def process_three_columns_batch(client, slice_dir, output_json, port, img_name):
+    """处理该图片切出来的所有块并合并保存
+    🌟 新增 img_name 参数、错题本日志、normalize_nulls（移植自王主任代码）"""
     slice_path = Path(slice_dir)
     l_files = sorted(slice_path.glob("block_*_L.png"))
     
@@ -217,20 +314,41 @@ def process_three_columns_batch(client, slice_dir, output_json, port):
         raise RuntimeError(f"在 {slice_dir} 中未找到 L 切片文件。")
 
     results = []
+    total_blocks = len(l_files)
+    
+    # 🌟 新增：在输出目录下准备一个错题本日志文件
+    error_log_file = Path(output_json).parent / "llm_json_errors_log.txt"
     
     for i, l_img in enumerate(l_files):
         prefix = l_img.stem.replace('_L', '')
         m_img = slice_path / f"{prefix}_M.png"
         r_img = slice_path / f"{prefix}_R.png"
         
-        # print(f"  [端口 {port}] 正在识别行: {prefix} ({i+1}/{len(l_files)})")
+        gpu_id = PORT_TO_GPU[port]
+        print(f"  [GPU {gpu_id} | {img_name}] 正在推理: {prefix} ({i+1}/{total_blocks})")
+        
         data_L = extract_single_part(client, l_img, PROMPT_L)
         data_M = extract_single_part(client, m_img, PROMPT_M)
         data_R = extract_single_part(client, r_img, PROMPT_R)
 
+        # 🌟 新增：诊断并记录"错题"（移植自王主任一单）
+        if "_raw" in data_L or "_raw" in data_M or "_raw" in data_R:
+            with open(error_log_file, "a", encoding="utf-8") as f:
+                f.write(f"\n{'='*50}\n")
+                f.write(f"🛑 发现错误: 图片 {img_name} -> 块 {prefix}\n")
+                if "_raw" in data_L: f.write(f"【左侧部分返回】:\n{data_L['_raw']}\n\n")
+                if "_raw" in data_M: f.write(f"【中间部分返回】:\n{data_M['_raw']}\n\n")
+                if "_raw" in data_R: f.write(f"【右侧部分返回】:\n{data_R['_raw']}\n\n")
+                f.write(f"{'='*50}\n")
+
         merged_row = {**data_L, **data_M, **data_R}
+        
+        # 记录完后，把 _raw 删掉，保持最终 JSON 干净
         if "_raw" in merged_row: del merged_row["_raw"]
+        
         merged_row["_block_id"] = prefix
+        # 🌟 核心修改：清洗无效的假 null
+        merged_row = normalize_nulls(merged_row)
         results.append(merged_row)
 
     with open(output_json, 'w', encoding='utf-8') as f:
@@ -266,7 +384,12 @@ def process_single_image(img_file, final_output_dir):
         
         # 识别
         client = Client(host=f'http://127.0.0.1:{port}')
-        process_three_columns_batch(client, temp_slice_dir, json_filepath, port)
+        
+        # 🌟 新增：尝试建档。如果已经建过，它内部会瞬间 return 跳过（移植自王主任二单）
+        extract_patient_info_once(client, temp_slice_dir, img_file.name)
+        
+        # 🌟 核心修改：将 img_file.name 作为最后一个参数传进去
+        process_three_columns_batch(client, temp_slice_dir, json_filepath, port, img_file.name)
         
         return f"✅ [成功] {img_file.name}"
         
