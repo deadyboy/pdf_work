@@ -7,9 +7,10 @@
   image_record1 — 王主任《记录单(一)》图片（文件或文件夹）
   image_record2 — 王主任《记录单(二)》图片（文件或文件夹）
   image_jin     — 金主任记录单图片（文件或文件夹）
-  image_mixed   — 混合图片文件夹（需先由 router.py 分类）
+  image_mixed   — 多种图片记录单混合（交给顶层 orchestrator/预分类器）
+  mixed         — DOCX/PDF/图片等多种媒体混合（交给顶层 orchestrator）
   pdf           — PDF 文件（需先转为图片）
-  docx          — DOCX 文件（交给 docx 处理器处理）
+  docx          — DOCX 文件（交给 docx_work pipeline）
   unknown       — 无法识别
 
 检测优先级：
@@ -120,10 +121,15 @@ def detect_file_type(input_path: str) -> Tuple[str, List[str]]:
         has_pdf = ".pdf" in ext_counts
         has_docx = ".docx" in ext_counts or ".doc" in ext_counts
 
-        if has_docx and not has_images and not has_pdf:
+        media_kinds = sum((has_images, has_pdf, has_docx))
+        if media_kinds > 1:
+            # Cross-media dispatch belongs to the top-level orchestrator.
+            return "mixed", [str(f) for f in _collect_images(p)]
+
+        if has_docx:
             return "docx", []
 
-        if has_pdf and not has_images:
+        if has_pdf:
             return "pdf", []
 
         if has_images:

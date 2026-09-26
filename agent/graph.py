@@ -3,7 +3,7 @@ LangGraph Agent 图定义
 ----------------------
 将现有处理流程（切图 → 推理 → 合并 → QC）封装为 LangGraph 节点，
 支持：
-  - 输入文件类型自动检测（image_record1 / image_record2 / image_jin / pdf）
+  - 输入文件类型自动检测（已执行支持：image_record1 / image_jin / pdf；其余显式 handoff）
   - 提取失败后自动重试（最多 MAX_RETRY 次）
   - 多图片并发处理（通过 ThreadPoolExecutor）
 
@@ -82,11 +82,11 @@ def _cutter_script(file_type: str) -> str:
     base = Path(__file__).parent.parent
     mapping = {
         "image_record1": "cutter_worker2（王主任数据一单）.py",
-        "image_record2": "cutter_worker2（王主任数据一单）.py",  # 二单暂用同一切割器
         "image_jin": "cutter_worker（金主任数据）.py",
     }
-    script_name = mapping.get(file_type, "cutter_worker（金主任数据）.py")
-    return str(base / script_name)
+    if file_type not in mapping:
+        raise ValueError(f"未迁移到 Agent 的记录单类型: {file_type}")
+    return str(base / mapping[file_type])
 
 
 def _cut_one_image(img_path: str, output_dir: str, file_type: str) -> None:
@@ -155,6 +155,7 @@ def cut_images_node(state: ImageProcessingState) -> dict:
         try:
             _cut_one_image(img_path, temp_dir, file_type)
             slice_dirs[img_name] = temp_dir
+            errors.pop(img_name, None)
         except Exception as e:
             errors[img_name] = f"cut_error: {e}"
 
@@ -166,6 +167,10 @@ def extract_slices_node(state: ImageProcessingState) -> dict:
     节点：对 slice_dirs 中的每个切片目录并发调用 LLM 推理。
     """
     slice_dirs = state.get("slice_dirs") or {}
+    pending_images = state.get("pending_images") or []
+    if pending_images:
+        pending_names = {Path(p).stem for p in pending_images}
+        slice_dirs = {k: v for k, v in slice_dirs.items() if k in pending_names}
     file_type = state.get("detected_file_type", "image_jin")
     raw_results = dict(state.get("raw_results") or {})
     errors = dict(state.get("errors") or {})
@@ -194,6 +199,7 @@ def extract_slices_node(state: ImageProcessingState) -> dict:
                 errors[img_name] = result["_error"]
             else:
                 raw_results[img_name] = result
+                errors.pop(img_name, None)
 
     return {"raw_results": raw_results, "errors": errors, "phase": "merge"}
 
@@ -259,6 +265,8 @@ def qc_check_node(state: ImageProcessingState) -> dict:
 
     pending = []
     for img_name, err_msg in list(errors.items()):
+        if img_name.startswith("__"):
+            continue
         current = retry_count.get(img_name, 0)
         if current < MAX_RETRY:
             pending.append(img_name)
@@ -278,6 +286,21 @@ def qc_check_node(state: ImageProcessingState) -> dict:
     return {"pending_images": [], "retry_count": retry_count, "phase": "done"}
 
 
+def unsupported_input_node(state: ImageProcessingState) -> dict:
+    """Fail closed for inputs owned by another pipeline or not yet migrated."""
+    ft = state.get("detected_file_type", "unknown")
+    messages = {
+        "docx": "DOCX 输入应交给 docx_work 的 field-oriented pipeline",
+        "mixed": "跨媒体 mixed 输入应由顶层 orchestrator 拆分后分发",
+        "image_mixed": "混合记录单图片需先分类后分别调用对应 vision pipeline",
+        "image_record2": "记录单(二)现有实现为 5 切片，尚未完整迁移到本 Agent graph",
+        "unknown": "无法识别输入类型",
+    }
+    return {
+        "errors": {**state.get("errors", {}), "__route": messages.get(ft, f"不支持的输入类型: {ft}")},
+        "phase": "done",
+    }
+
 def cleanup_slices_node(state: ImageProcessingState) -> dict:
     """
     节点（可选）：清理所有临时切片目录，节省磁盘空间。
@@ -296,12 +319,19 @@ def route_after_detect(state: ImageProcessingState) -> str:
     ft = state.get("detected_file_type", "unknown")
     if ft == "pdf":
         return "convert_pdf"
-    if ft.startswith("image"):
+    if ft in {"image_record1", "image_jin"}:
         return "cut_images"
-    if ft == "docx":
-        return "docx_handler"  # 如需集成 docx 处理器，在此扩展
-    return END
+    return "unsupported"
 
+
+def route_after_pdf(state: ImageProcessingState) -> str:
+    """Only continue when PDF conversion actually produced classified images."""
+    if state.get("phase") == "cut" and state.get("image_files"):
+        ft = state.get("detected_file_type", "unknown")
+        if ft in {"image_record1", "image_jin"}:
+            return "cut_images"
+        return "unsupported"
+    return END
 
 def route_after_qc(state: ImageProcessingState) -> str:
     """qc_check 之后的条件路由：重试或结束。"""
@@ -339,6 +369,7 @@ def build_agent_graph():
     graph.add_node("merge_results", merge_results_node)
     graph.add_node("qc_check", qc_check_node)
     graph.add_node("cleanup", cleanup_slices_node)
+    graph.add_node("unsupported", unsupported_input_node)
 
     # 入口 → 检测文件类型
     graph.add_edge(START, "detect_type")
@@ -350,12 +381,22 @@ def build_agent_graph():
         {
             "convert_pdf": "convert_pdf",
             "cut_images": "cut_images",
-            END: END,
+            "unsupported": "unsupported",
         },
     )
 
-    # PDF 转图片完成 → 切图
-    graph.add_edge("convert_pdf", "cut_images")
+    graph.add_edge("unsupported", END)
+
+    # PDF 转图片成功后才进入视觉 pipeline；失败或未迁移 subtype 直接结束/交接
+    graph.add_conditional_edges(
+        "convert_pdf",
+        route_after_pdf,
+        {
+            "cut_images": "cut_images",
+            "unsupported": "unsupported",
+            END: END,
+        },
+    )
 
     # 切图 → 推理
     graph.add_edge("cut_images", "extract_slices")
@@ -397,7 +438,7 @@ def run_agent(
     运行 ICU 记录单提取 Agent。
 
     Args:
-        input_path:   输入路径（图片 / 图片文件夹 / PDF / DOCX）
+        input_path:   输入路径（图片 / 图片文件夹 / PDF；DOCX/mixed 会返回显式 handoff 错误）
         output_dir:   输出目录，最终结果保存为 output_dir/merged_result.json
         model:        推理模型名（vLLM 用 HuggingFace 名，Ollama 用模型标签）
         llm_backend:  "vllm"（推荐）或 "ollama"

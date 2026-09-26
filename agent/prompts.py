@@ -5,9 +5,9 @@ Prompt 映射表
 并提供按记录单类型查询 (prompts, slice_suffix) 的接口。
 
 约定：
-  每种记录单类型对应 N 张列切片（N = 3）。
+  当前 Agent 只迁移并验证了记录单(一)与金主任记录单。
   SLICE_SUFFIX[file_type] 给出各列的文件名后缀（不含 .png）。
-  get_prompts_for_type(file_type) 返回对应的 prompt 列表（顺序与 SLICE_SUFFIX 对齐）。
+  记录单(二)现有业务脚本是 5 切片版本，在对应 prompt/cutter 完整迁移前不在此表中伪装支持。
 """
 from __future__ import annotations
 from typing import List
@@ -18,7 +18,6 @@ from typing import List
 
 SLICE_SUFFIX: dict[str, List[str]] = {
     "image_record1": ["1", "2", "3"],   # block_XX_1.png / _2.png / _3.png
-    "image_record2": ["1", "2", "3"],
     "image_jin":     ["L", "M", "R"],   # block_XX_L.png / _M.png / _R.png
     "unknown":       ["L", "M", "R"],
 }
@@ -244,7 +243,6 @@ JIN_PROMPT_R = """
 
 _PROMPT_MAP: dict[str, List[str]] = {
     "image_record1": [RECORD1_PROMPT_1, RECORD1_PROMPT_2, RECORD1_PROMPT_3],
-    "image_record2": [RECORD1_PROMPT_1, RECORD1_PROMPT_2, RECORD1_PROMPT_3],
     "image_jin":     [JIN_PROMPT_L, JIN_PROMPT_M, JIN_PROMPT_R],
     "unknown":       [JIN_PROMPT_L, JIN_PROMPT_M, JIN_PROMPT_R],
 }
