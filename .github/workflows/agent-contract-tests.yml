@@ -1,0 +1,20 @@
+name: agent-contract-tests
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  contract:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install orchestration dependency
+        run: pip install "langgraph>=1.2.12,<1.3"
+      - name: Syntax check
+        run: python -m py_compile agent/*.py agent_cli.py
+      - name: Agent contract tests
+        run: python -m unittest discover -s tests -v
